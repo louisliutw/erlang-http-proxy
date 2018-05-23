@@ -1,11 +1,11 @@
 -module(toppage_handler).
 
--export([init/3]).
+-export([init/2]).
 -export([handle/2]).
 -export([terminate/2]).
 
 -type request() :: cowboy_req:req().
--type headers() :: cowboy_http:headers().
+-type headers() :: cowboy:http_headers().
 -type processor() :: fun((binary()) -> binary()).
 -type finalizer() :: fun(() -> binary()).
 -type streamfunc() :: fun((any()) -> ok | { error, atom() }).
@@ -33,14 +33,13 @@
 % copy-pasted from /usr/lib/erlang/lib/erts-5.9.1/src/zlib.erl
 -define(MAX_WBITS, 15).
 
-init(_Transport, Req, []) ->
-    lager:debug("~p Initializing...", [self()]),
-    { ok, EnableGzip } = application:get_env(http_proxy, enable_gzip),
-    {Headers, _} = cowboy_req:headers(Req),
+init(Req, _Opts) ->
+    lager:log(info, "~p Initializing...", [self()]),
+    { ok, EnableGzip } = application:get_env(http_proxy, enable_gzip, {ok, false}),
     AcceptGzip =
-        case proplists:lookup(<<"accept-encoding">>, Headers) of
-            none -> false;
-            {_Key, AcceptEncoding} ->
+        case cowboy_req:header(<<"accept-encoding">>, Req) of
+            undefined -> false;
+            AcceptEncoding ->
                 lists:any(
                     fun(X) -> X == "gzip" end,
                     string:tokens(
@@ -58,7 +57,7 @@ init(_Transport, Req, []) ->
         ibrowse_options = init_ibrowse_options(),
         callbacks = init_default_callbacks()
     },
-    {ok, Req, State}.
+    handle(Req, State).
 
 handle(
         Req,
@@ -67,25 +66,25 @@ handle(
             rewrite_rules = RewriteRules,
             this_node = ThisNode
         } = State) ->
-    {Headers, _} = cowboy_req:headers(Req),
-    {Method, _} = cowboy_req:method(Req),
-    {ok, Body, _} = cowboy_req:body(Req),
-    Url = case proplists:lookup(?SECRET_PROXY_HEADER, Headers) of
-            {?SECRET_PROXY_HEADER, ThisNode} ->
+    Headers = cowboy_req:headers(Req),
+    Method = cowboy_req:method(Req),
+    {ok, Body, _} = readbody(Req, <<>>),
+    Url = case cowboy_req:header(?SECRET_PROXY_HEADER, Req) of
+            ThisNode ->
                 {Peer, _} =  cowboy_req:peer(Req),
-                lager:warning("~p Recursive request from ~p!", [self(), Peer]),
+                lager:log(warning, "~p Recursive request from ~p!", [self(), Peer]),
                 ?HACKER_REDIRECT_PAGE;
-            none -> 
-                { ReqUrl, _ } = cowboy_req:url(Req),
+            undefined -> 
+                ReqUrl = binary:list_to_bin(lists:flatten(cowboy_req:uri(Req))),
                 RewriteResult = apply_rewrite_rules(ReqUrl, RewriteRules),
                 case ReqUrl == RewriteResult of
                     true -> ok;
                     false ->
-                        lager:debug("~p Request URL: ~p", [self(), ReqUrl])
+                        lager:log(info, "~p Request URL: ~s", [self(), ReqUrl])
                 end,
                 RewriteResult
         end,
-    lager:debug("~p Fetching ~s", [self(), Url]),
+    lager:log(info, "~p Fetching ~s", [self(), Url]),
     ModifiedHeaders = modify_req_headers(Headers, ThisNode),
     {ibrowse_req_id, _RequestId} = ibrowse:send_req(
         binary_to_list(Url),
@@ -97,7 +96,7 @@ handle(
     ),
 
     FinalReq = receive_loop(State, Req),
-    lager:debug("~p Done", [self()]),
+    lager:log(info, "~p Done", [self()]),
     {ok, FinalReq, State}.
 
 terminate(_Req, _State) ->
@@ -107,9 +106,16 @@ terminate(_Req, _State) ->
 %%% Internal functions
 %%%===================================================================
 
+-spec readbody(request(), string()) -> {ok, string(), request()}.
+readbody (Req0, Acc) ->
+    case cowboy_req:read_body(Req0) of
+	    {ok, Data, Req} -> {ok, << Acc/binary, Data/binary >>, Req};
+	    {more, Data, Req} -> readbody(Req, << Acc/binary, Data/binary >>)
+end.
+
 -spec init_rewrite_rules() -> rewrite_rules().
 init_rewrite_rules() ->
-    { ok, RewriteRules } = application:get_env(http_proxy, rewrite_rules),
+    { ok, RewriteRules } = application:get_env(http_proxy, rewrite_rules, {ok, []}),
     lists:map(
         fun({ReString,ReplaceString}) ->
             {ok, CompiledRe} = re:compile(ReString),
@@ -120,14 +126,14 @@ init_rewrite_rules() ->
 
 -spec init_ibrowse_options() -> ibrowse_options().
 init_ibrowse_options() ->
-    { ok, SyncStream } = application:get_env(http_proxy, sync_stream),
+    { ok, SyncStream } = application:get_env(http_proxy, sync_stream, {ok, false}),
     OptionsTemplate = [{ response_format, binary }],
     case SyncStream of
         true ->
             [ {stream_to, {self(), once}} | OptionsTemplate ];
         false ->
             { ok, ChunkSize } = application:get_env(
-                http_proxy, stream_chunk_size),
+                http_proxy, stream_chunk_size, {ok, 4096}),
             OptionsTemplate ++ [
                 { stream_to, self() },
                 { stream_chunk_size, ChunkSize }
@@ -136,7 +142,7 @@ init_ibrowse_options() ->
 
 -spec init_default_callbacks() -> #callbacks{}.
 init_default_callbacks() -> 
-    { ok, SyncStream } = application:get_env(http_proxy, sync_stream),
+    { ok, SyncStream } = application:get_env(http_proxy, sync_stream, {ok, false}),
     CallbacksTemplate = #callbacks {
             processor = fun(X) -> X end,
             finalizer = fun() -> <<>> end,
@@ -179,25 +185,25 @@ receive_loop(
                     false ->
                         { ModifiedHeaders, Callbacks }
                 end,
-            { ok, NewReq } = send_headers(Req, Code, NewHeaders),
+            NewReq = send_headers(Req, Code, NewHeaders),
             receive_loop(State#state { callbacks = NewCallbacks }, NewReq);
         { ibrowse_async_response, RequestId, Data } ->
             ok = StreamNext(RequestId),
-            ok = send_chunk(Req, Processor(Data)),
+            ok = send_chunk(Req, nofin, Processor(Data)),
             receive_loop(State, Req);
 
         { ibrowse_async_response_end, RequestId } ->
             ok = StreamClose(RequestId),
-            ok = send_chunk(Req, Finalizer()),
+            ok = send_chunk(Req, fin, Finalizer()),
             Req 
     end.
 
--spec send_chunk(request(), binary()) -> ok | {error, atom()}.
-send_chunk(Req, Data) ->
+-spec send_chunk(request(), boolean(), binary()) -> ok | {error, atom()}.
+send_chunk(Req, IsFin, Data) ->
     case Data of
         <<>> -> ok;
         _ ->
-            cowboy_req:chunk(Data, Req)
+            cowboy_req:stream_body(Data, IsFin, Req)
     end.
 
 -spec apply_rewrite_rules(binary(), rewrite_rules()) -> binary().
@@ -214,7 +220,7 @@ apply_rewrite_rules(Url, [{CompiledRe,ReplaceString}|OtherRules]) ->
 optional_add_gzip_compression(Headers, Callbacks) ->
     case proplists:get_value(<<"content-encoding">>, Headers) of 
         undefined ->
-            lager:debug("~p Using gzip compression", [self()]),
+            lager:log(debug, "~p Using gzip compression", [self()]),
             ZlibStream = zlib:open(),
             ok = zlib:deflateInit(ZlibStream, default, deflated, 16+?MAX_WBITS, 8, default),
             {
@@ -243,40 +249,31 @@ optional_add_gzip_compression(Headers, Callbacks) ->
 
 -spec send_headers(request(), string(), headers()) -> { ok, request() }.
 send_headers(Req, Code, Headers) ->
-    NewReq = lists:foldl(
-        fun({HeaderName, HeaderValue}, Acc) ->
-            cowboy_req:set_resp_header(
-                HeaderName,
-                HeaderValue,
-                Acc)
-        end,
-        Req,
-        Headers
-    ),
-    cowboy_req:chunked_reply(list_to_integer(Code), NewReq).
+    lager:log(info, '~p', Headers),
+    NewReq = cowboy_req:set_resp_headers(Headers, Req),
+    cowboy_req:stream_reply(list_to_integer(Code), NewReq).
 
 -spec modify_req_headers(headers(), binary()) -> headers().
 modify_req_headers(Headers, ThisNode) ->
-    FilteredHeaders = lists:filter(
-        fun({<<"proxy-connection">>, _}) -> false;
-           ({?SECRET_PROXY_HEADER, _}) -> false;
-           ({<<"host">>, _}) -> false;
-           ({_, _}) -> true
+    FilteredHeaders = maps:filter(
+        fun(<<"proxy-connection">>, _) -> false;
+           (?SECRET_PROXY_HEADER, _) -> false;
+           (<<"host">>, _) -> false;
+           (_, _) -> true
         end,
         Headers
     ),
-    [ {?SECRET_PROXY_HEADER, ThisNode}
-        | FilteredHeaders].
+    maps:put(?SECRET_PROXY_HEADER, ThisNode, FilteredHeaders).
 
 -spec modify_res_headers(headers()) -> headers().
 modify_res_headers(Headers) ->
-    lists:filter(
-        fun({<<"date">>, _}) -> false;
-           ({<<"transfer-encoding">>, _}) -> false;
-           ({<<"connection">>, _}) -> false;
-           ({<<"server">>, _}) -> false;
-           ({<<"content-length">>, _}) -> false;
-           ({_, _}) -> true
+    maps:filter(
+        fun(<<"date">>, _) -> false;
+           (<<"transfer-encoding">>, _) -> false;
+           (<<"connection">>, _) -> false;
+           (<<"server">>, _) -> false;
+           (<<"content-length">>, _) -> false;
+           (_, _) -> true
         end,
         Headers
     ).
@@ -291,21 +288,11 @@ req_type_cowboy_to_ibrowse(RequestBinary) ->
 
 -spec headers_ibrowse_to_cowboy([{string(),string()}]) -> headers().
 headers_ibrowse_to_cowboy(Headers) ->
-    lists:map(
-            fun({K,V}) -> 
-                { list_to_binary(string:to_lower(K)), list_to_binary(V) }
-            end,
-            Headers
-    ). 
+	maps:from_list(Headers).
 
 -spec headers_cowboy_to_ibrowse(headers()) -> [{string(),string()}].
 headers_cowboy_to_ibrowse(Headers) ->
-    lists:map(
-            fun({K,V}) -> 
-                { binary_to_list(K), binary_to_list(V) }
-            end,
-            Headers
-    ).
+	maps:to_list(Headers).
 
 -spec this_node() -> binary().
 this_node() ->

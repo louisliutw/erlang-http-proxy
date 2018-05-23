@@ -12,15 +12,16 @@
 start(_StartType, _StartArgs) ->
     ibrowse:start(),
     lager:start(),
-    Dispatch = [
+    Dispatch = cowboy_router:compile([
             {'_', [ { '_', toppage_handler, [] } ] }
-        ],
-    {ok, Port} = application:get_env(port),
-    {ok, Timeout} = application:get_env(timeout),
-    {ok, Workers} = application:get_env(workers),
-    {ok, _} = cowboy:start_http(http, Workers,
+        ]),
+    %{ok, Port} = application:get_env(port),
+    {ok, Port} = application:get_env(http_proxy, port, {ok, 8080}),
+    {ok, Timeout} = application:get_env(http_proxy, timeout, {ok, 10000}),
+    %{ok, Workers} = application:get_env(workers),
+    {ok, _} = cowboy:start_clear(http,
         [{port, Port}],
-        [{dispatch, Dispatch},{timeout, Timeout}]
+	#{env => #{dispatch => Dispatch}, request_timeout => Timeout}
     ),
     http_proxy_sup:start_link().
 

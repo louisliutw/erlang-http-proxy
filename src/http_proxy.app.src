@@ -3,10 +3,18 @@
   {description, ""},
   {vsn, "1"},
   {registered, []},
+{modules, [http_proxy_app, http_proxy_sup, toppage_handler]},
   {applications, [
                   kernel,
                   stdlib,
-                  cowboy
+		  crypto,
+ 		asn1,
+		public_key,
+		ssl,
+		ranch,
+		cowlib,
+                  cowboy,
+		  ibrowse
                  ]},
   {mod, { http_proxy_app, []}},
   {env, []}

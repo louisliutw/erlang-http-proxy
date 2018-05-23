@@ -6,4 +6,4 @@ erl \
   -name http_proxy@`hostname` \
   -pa ebin deps/*/ebin \
   -config app.config \
-  -eval 'lists:foreach(fun(App) -> ok = application:start(App) end, [ ranch, crypto, cowboy, http_proxy ])'
+  -eval 'lists:foreach(fun(App) -> ok = application:start(App) end, [ crypto, asn1, public_key, ssl, ranch, cowlib, cowboy, ibrowse, http_proxy ])'
